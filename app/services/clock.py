@@ -1,7 +1,7 @@
-"""Accelerated brokerage clock.
+"""Brokerage simulation clock.
 
-Wall-clock seconds are multiplied by `simulation_speed` so multi-day
-pickup/delivery windows play out in minutes during a student demo.
+Wall-clock seconds are multiplied by `simulation_speed`.
+Default is 1.0 (real time). Raise it for accelerated demos.
 """
 
 from __future__ import annotations

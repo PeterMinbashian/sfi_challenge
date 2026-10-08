@@ -30,7 +30,6 @@ class FleetUnitOut(BaseModel):
     first_name: str
     last_name: str
     home_terminal_id: int
-    equipment_type: str
     status: str
     current_latitude: float
     current_longitude: float
@@ -75,11 +74,12 @@ class HistoricalShipmentOut(BaseModel):
     destination_longitude: float
     distance_miles: float
     weight_lbs: int
-    equipment_type: str
     order_type: str
     offered_rate: float
     bid_rate: Optional[float] = None
     won: bool
+    cost_per_mile: Optional[float] = None
+    estimated_cost: Optional[float] = None
     margin_estimate: Optional[float] = None
     shipped_at: datetime
 
@@ -103,8 +103,14 @@ class LiveOrderOut(BaseModel):
     destination_terminal_code: Optional[str] = None
     distance_miles: float
     weight_lbs: int
-    equipment_type: str
     offered_rate: Optional[float] = None
+    cost_per_mile: Optional[float] = None
+    estimated_cost: Optional[float] = None
+    # Empty miles from likely board unit → pickup (computed at read time)
+    estimated_deadhead_miles: Optional[float] = None
+    estimated_deadhead_cost: Optional[float] = None
+    # estimated_cost + estimated_deadhead_cost
+    estimated_total_cost: Optional[float] = None
     pickup_at: datetime
     delivery_at: datetime
     expires_at: datetime
@@ -154,3 +160,34 @@ class SimulationClockOut(BaseModel):
 
 class SimulationSpeedRequest(BaseModel):
     simulation_speed: float = Field(ge=1, le=100_000, description="Sim seconds per wall second")
+
+
+class SimulationSettingsOut(BaseModel):
+    simulation_speed: float
+    order_interval_seconds: float
+    order_ttl_sim_minutes: int
+    bid_decision_sim_minutes: int
+    note: str
+
+
+class SimulationSettingsRequest(BaseModel):
+    simulation_speed: float | None = Field(
+        default=None, ge=1, le=100_000, description="Sim seconds per wall second"
+    )
+    order_interval_seconds: float | None = Field(
+        default=None,
+        ge=0.5,
+        le=3600,
+        description="Wall seconds between new live orders (lower = faster board)",
+    )
+
+
+class SpawnOrdersRequest(BaseModel):
+    count: int = Field(default=6, ge=1, le=50, description="How many orders to create now")
+
+
+class SpawnOrdersOut(BaseModel):
+    created: int
+    fixed_rate: int
+    open_bid: int
+    external_ids: list[str]

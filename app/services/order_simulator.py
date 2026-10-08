@@ -16,10 +16,9 @@ from app.config import settings
 from app.database import SessionLocal
 from app.models import LiveOrder, Terminal
 from app.schemas import LiveOrderOut
-from app.history_data import haversine_miles, jitter
-from app.seed import EQUIPMENT
+from app.history_data import estimate_operating_cost, haversine_miles, jitter
 from app.services.clock import clock
-from app.services.dispatch import advance_order_lifecycle
+from app.services.dispatch import advance_order_lifecycle, estimate_board_deadhead
 
 log = logging.getLogger("freight.simulator")
 
@@ -54,11 +53,26 @@ class OrderHub:
 hub = OrderHub()
 
 
-def order_to_dict(order: LiveOrder, now=None) -> dict[str, Any]:
+def order_to_dict(
+    order: LiveOrder,
+    now=None,
+    db: Session | None = None,
+) -> dict[str, Any]:
     now = now or clock.now()
     remaining = max(0, int((order.expires_at - now).total_seconds()))
     data = LiveOrderOut.model_validate(order).model_dump(mode="json")
     data["seconds_remaining"] = remaining
+
+    loaded = float(order.estimated_cost or 0.0)
+    deadhead_miles = 0.0
+    deadhead_cost = 0.0
+    # Deadhead estimate is most meaningful while the load is still bookable
+    if db is not None and order.status in {"open", "bid_submitted"}:
+        deadhead_miles, deadhead_cost = estimate_board_deadhead(db, order)
+
+    data["estimated_deadhead_miles"] = deadhead_miles
+    data["estimated_deadhead_cost"] = deadhead_cost
+    data["estimated_total_cost"] = round(loaded + deadhead_cost, 2)
     return data
 
 
@@ -67,7 +81,11 @@ def expire_stale_orders(db: Session) -> dict:
     return advance_order_lifecycle(db)
 
 
-def create_simulated_order(db: Session, rng: Optional[random.Random] = None) -> LiveOrder:
+def create_simulated_order(
+    db: Session,
+    rng: Optional[random.Random] = None,
+    order_type: Optional[str] = None,
+) -> LiveOrder:
     rng = rng or random.Random()
     terminals = db.query(Terminal).all()
     if len(terminals) < 2:
@@ -89,8 +107,9 @@ def create_simulated_order(db: Session, rng: Optional[random.Random] = None) -> 
         o_code, d_code = None, None
 
     miles = haversine_miles(o_lat, o_lon, d_lat, d_lon)
-    order_type = "fixed_rate" if rng.random() < 0.55 else "open_bid"
-    equipment = rng.choice(EQUIPMENT)
+    if order_type not in {"fixed_rate", "open_bid"}:
+        order_type = "fixed_rate" if rng.random() < 0.55 else "open_bid"
+    cost_per_mile, estimated_cost = estimate_operating_cost(miles, rng=rng)
     # Fixed-rate posts a Book-It-Now price; open-bid has no offered_rate (manual bid in UI)
     offered = round(miles * rng.uniform(2.0, 3.5), 2) if order_type == "fixed_rate" else None
 
@@ -116,9 +135,15 @@ def create_simulated_order(db: Session, rng: Optional[random.Random] = None) -> 
         destination_longitude=d_lon,
         destination_terminal_code=d_code,
         distance_miles=miles,
-        weight_lbs=rng.randint(8_000, 44_000),
-        equipment_type=equipment,
+        # Most loads are legal; a minority are overweight so the board can reject (409)
+        weight_lbs=(
+            rng.randint(settings.max_weight_lbs + 500, settings.max_weight_lbs + 8_000)
+            if rng.random() < 0.08
+            else rng.randint(8_000, settings.max_weight_lbs)
+        ),
         offered_rate=offered,
+        cost_per_mile=cost_per_mile,
+        estimated_cost=estimated_cost,
         pickup_at=pickup,
         delivery_at=delivery,
         expires_at=expires,
@@ -148,7 +173,7 @@ async def simulator_loop(stop_event: asyncio.Event) -> None:
                 order = create_simulated_order(db)
                 payload = {
                     "event": "order.created",
-                    "order": order_to_dict(order),
+                    "order": order_to_dict(order, db=db),
                     "clock": clock.snapshot(),
                 }
             finally:

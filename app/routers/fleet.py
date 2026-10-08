@@ -34,7 +34,6 @@ def fleet_availability(
 def list_units(
     terminal_code: str | None = Query(None, description="Filter by home terminal code"),
     status: str | None = Query(None, description="available|assigned|off_duty|maintenance"),
-    equipment_type: str | None = Query(None, description="dry_van|reefer|flatbed"),
     db: Session = Depends(get_db),
 ) -> list[Driver]:
     q = db.query(Driver)
@@ -45,8 +44,6 @@ def list_units(
         q = q.filter(Driver.home_terminal_id == terminal.id)
     if status:
         q = q.filter(Driver.status == status)
-    if equipment_type:
-        q = q.filter(Driver.equipment_type == equipment_type)
     return q.order_by(Driver.employee_code).all()
 
 
@@ -54,11 +51,10 @@ def list_units(
 def list_drivers(
     terminal_code: str | None = Query(None),
     status: str | None = Query(None),
-    equipment_type: str | None = Query(None),
     db: Session = Depends(get_db),
 ) -> list[Driver]:
     """Alias of /fleet/units (driver and truck are one unit)."""
-    return list_units(terminal_code=terminal_code, status=status, equipment_type=equipment_type, db=db)
+    return list_units(terminal_code=terminal_code, status=status, db=db)
 
 
 @router.get("/snapshot", response_model=list[FleetSnapshot])

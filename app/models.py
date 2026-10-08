@@ -39,7 +39,6 @@ class Driver(Base):
     first_name: Mapped[str] = mapped_column(String(60))
     last_name: Mapped[str] = mapped_column(String(60))
     home_terminal_id: Mapped[int] = mapped_column(ForeignKey("terminals.id"), index=True)
-    equipment_type: Mapped[str] = mapped_column(String(30), default="dry_van")
     status: Mapped[str] = mapped_column(String(20), default="available")  # available|assigned|off_duty|maintenance
     current_latitude: Mapped[float] = mapped_column(Float)
     current_longitude: Mapped[float] = mapped_column(Float)
@@ -63,11 +62,13 @@ class HistoricalShipment(Base):
     destination_longitude: Mapped[float] = mapped_column(Float)
     distance_miles: Mapped[float] = mapped_column(Float)
     weight_lbs: Mapped[int] = mapped_column(Integer)
-    equipment_type: Mapped[str] = mapped_column(String(30))
     order_type: Mapped[str] = mapped_column(String(20))  # fixed_rate|open_bid
     offered_rate: Mapped[float] = mapped_column(Float)
     bid_rate: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     won: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Carrier operating cost for the loaded miles (fuel + driver + wear); always present
+    cost_per_mile: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    estimated_cost: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     margin_estimate: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     shipped_at: Mapped[datetime] = mapped_column(DateTime, index=True)
 
@@ -91,8 +92,10 @@ class LiveOrder(Base):
     destination_terminal_code: Mapped[Optional[str]] = mapped_column(String(8), nullable=True)
     distance_miles: Mapped[float] = mapped_column(Float)
     weight_lbs: Mapped[int] = mapped_column(Integer)
-    equipment_type: Mapped[str] = mapped_column(String(30))
     offered_rate: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    # Published so students can compute margin without inventing a cost model
+    cost_per_mile: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    estimated_cost: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     pickup_at: Mapped[datetime] = mapped_column(DateTime)
     delivery_at: Mapped[datetime] = mapped_column(DateTime)
     expires_at: Mapped[datetime] = mapped_column(DateTime, index=True)

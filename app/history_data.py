@@ -38,11 +38,12 @@ CSV_COLUMNS = [
     "destination_longitude",
     "distance_miles",
     "weight_lbs",
-    "equipment_type",
     "order_type",
     "offered_rate",
     "bid_rate",
     "won",
+    "cost_per_mile",
+    "estimated_cost",
     "margin_estimate",
     "shipped_at",
     # Extra analytics columns (also useful for ML feature engineering)
@@ -73,8 +74,6 @@ _REGION_OUT_RPM = {
     "WC": 2.85,
 }
 
-_EQUIP_MULT = {"dry_van": 1.0, "reefer": 1.18, "flatbed": 1.12}
-
 # Popular freight corridors get slightly tighter / higher volume (weighted sampling)
 _HOT_LANES = {
     ("LAX", "DFW"), ("LAX", "ATL"), ("LAX", "CHI"), ("LAX", "EWR"),
@@ -103,6 +102,26 @@ def jitter(lat: float, lon: float, miles: float, rng: random.Random) -> tuple[fl
     return round(lat + dlat, 5), round(lon + dlon, 5)
 
 
+def estimate_operating_cost(
+    miles: float,
+    *,
+    fuel_rpm: float | None = None,
+    rng: random.Random | None = None,
+) -> tuple[float, float]:
+    """
+    Carrier all-in operating cost for loaded miles (fuel + driver pay + wear).
+
+    Returns (cost_per_mile, estimated_cost_total_usd).
+    Students use this vs offered_rate / bid_rate to decide profitability.
+    """
+    rng = rng or random.Random()
+    fuel = fuel_rpm if fuel_rpm is not None else round(rng.uniform(0.35, 0.55), 3)
+    # Driver + fixed ops dominate; fuel is the variable piece
+    cost_per_mile = round(fuel + rng.uniform(1.15, 1.55), 3)
+    estimated_cost = round(miles * cost_per_mile, 2)
+    return cost_per_mile, estimated_cost
+
+
 def _season(month: int) -> str:
     if month in (12, 1, 2):
         return "winter"
@@ -113,17 +132,8 @@ def _season(month: int) -> str:
     return "fall"
 
 
-def _seasonal_mult(season: str, equipment: str) -> float:
-    # Produce / construction / holiday freight patterns
-    table = {
-        ("summer", "reefer"): 1.14,
-        ("fall", "dry_van"): 1.08,
-        ("winter", "dry_van"): 1.05,
-        ("winter", "reefer"): 0.97,
-        ("spring", "flatbed"): 1.10,
-        ("summer", "flatbed"): 1.06,
-    }
-    return table.get((season, equipment), 1.0)
+def _seasonal_mult(season: str) -> float:
+    return {"winter": 1.04, "spring": 1.02, "summer": 1.06, "fall": 1.08}.get(season, 1.0)
 
 
 def _fuel_rpm(shipped_at: datetime, rng: random.Random) -> float:
@@ -133,19 +143,12 @@ def _fuel_rpm(shipped_at: datetime, rng: random.Random) -> float:
     return round(base + rng.uniform(-0.04, 0.04), 3)
 
 
-def _weight_for_equipment(equipment: str, rng: random.Random) -> int:
-    if equipment == "reefer":
-        # Often denser / partials less common
-        return int(rng.gauss(36_000, 4_500))
-    if equipment == "flatbed":
-        return int(rng.gauss(32_000, 8_000))
-    # dry van — many 40-43k truckload, some LTL-ish partials
+def _sample_weight(rng: random.Random) -> int:
+    # Mostly full truckloads, occasional lighter loads
     if rng.random() < 0.18:
-        return int(rng.uniform(10_000, 28_000))
-    return int(rng.gauss(40_000, 3_200))
-
-
-def _clamp_weight(w: int) -> int:
+        w = int(rng.uniform(10_000, 28_000))
+    else:
+        w = int(rng.gauss(40_000, 3_200))
     return max(5_000, min(45_000, w))
 
 
@@ -163,7 +166,6 @@ def _market_rpm(
     origin: Terminal,
     dest: Terminal,
     miles: float,
-    equipment: str,
     shipped_at: datetime,
     rng: random.Random,
 ) -> float:
@@ -189,9 +191,7 @@ def _market_rpm(
     elif miles > 1800:
         base -= 0.12
 
-    season = _season(shipped_at.month)
-    base *= _EQUIP_MULT.get(equipment, 1.0)
-    base *= _seasonal_mult(season, equipment)
+    base *= _seasonal_mult(_season(shipped_at.month))
     base *= rng.uniform(0.93, 1.07)
     return round(max(1.6, base), 3)
 
@@ -219,11 +219,6 @@ def generate_history_records(
             # Force a more useful TL distance if jitter collapsed oddly
             miles = haversine_miles(origin.latitude, origin.longitude, dest.latitude, dest.longitude)
 
-        equipment = rng.choices(
-            ["dry_van", "reefer", "flatbed"],
-            weights=[0.62, 0.22, 0.16],
-            k=1,
-        )[0]
         order_type = "fixed_rate" if rng.random() < 0.58 else "open_bid"
 
         # Ship dates over ~18 months with weekday bias (fewer weekend bookings)
@@ -233,11 +228,11 @@ def generate_history_records(
             shipped_at -= timedelta(days=shipped_at.weekday() - 4)
 
         season = _season(shipped_at.month)
-        market_rpm = _market_rpm(origin, dest, miles, equipment, shipped_at, rng)
+        market_rpm = _market_rpm(origin, dest, miles, shipped_at, rng)
         fuel_rpm = _fuel_rpm(shipped_at, rng)
         all_in = round(market_rpm + fuel_rpm * 0.35, 3)
 
-        weight = _clamp_weight(_weight_for_equipment(equipment, rng))
+        weight = _sample_weight(rng)
         # Heavier loads nudge rate up slightly
         if weight >= 42_000:
             all_in = round(all_in * 1.03, 3)
@@ -277,13 +272,9 @@ def generate_history_records(
             won = rng.random() < win_p
             payout = bid if won else None
 
-        # Operating cost ~ fuel + driver + wear; margin only when won
-        cost_rpm = fuel_rpm + rng.uniform(1.15, 1.55)
-        if equipment == "reefer":
-            cost_rpm += 0.18
-        if equipment == "flatbed":
-            cost_rpm += 0.10
-        margin = round((payout - miles * cost_rpm), 2) if (won and payout) else None
+        # Operating cost always published; margin only when the load was won
+        cost_per_mile, estimated_cost = estimate_operating_cost(miles, fuel_rpm=fuel_rpm, rng=rng)
+        margin = round(payout - estimated_cost, 2) if (won and payout) else None
 
         rows.append(
             {
@@ -299,11 +290,12 @@ def generate_history_records(
                 "destination_longitude": d_lon,
                 "distance_miles": miles,
                 "weight_lbs": weight,
-                "equipment_type": equipment,
                 "order_type": order_type,
                 "offered_rate": offered,
                 "bid_rate": bid if bid is not None else "",
                 "won": won,
+                "cost_per_mile": cost_per_mile,
+                "estimated_cost": estimated_cost,
                 "margin_estimate": margin if margin is not None else "",
                 "shipped_at": shipped_at.replace(microsecond=0).isoformat(sep=" "),
                 "market_rpm": market_rpm,
@@ -330,6 +322,10 @@ def write_history_csv(rows: Iterable[dict], path: Path | None = None) -> Path:
                 out["bid_rate"] = ""
             if out.get("margin_estimate") in (None,):
                 out["margin_estimate"] = ""
+            if out.get("cost_per_mile") in (None,):
+                out["cost_per_mile"] = ""
+            if out.get("estimated_cost") in (None,):
+                out["estimated_cost"] = ""
             writer.writerow(out)
     return path
 
@@ -367,11 +363,12 @@ def insert_history_rows(db: Session, rows: list[dict]) -> int:
                 destination_longitude=float(row["destination_longitude"]),
                 distance_miles=float(row["distance_miles"]),
                 weight_lbs=int(float(row["weight_lbs"])),
-                equipment_type=row["equipment_type"],
                 order_type=row["order_type"],
                 offered_rate=float(row["offered_rate"]),
                 bid_rate=_parse_optional_float(row.get("bid_rate")),
                 won=_parse_bool(row["won"]),
+                cost_per_mile=_parse_optional_float(row.get("cost_per_mile")),
+                estimated_cost=_parse_optional_float(row.get("estimated_cost")),
                 margin_estimate=_parse_optional_float(row.get("margin_estimate")),
                 shipped_at=datetime.fromisoformat(str(row["shipped_at"]).replace("Z", "")),
             )
@@ -386,6 +383,10 @@ def export_db_history_csv(db: Session, path: Path | None = None) -> Path:
     records = []
     for i, row in enumerate(db.query(HistoricalShipment).order_by(HistoricalShipment.id).all(), start=1):
         all_in = round(row.offered_rate / max(row.distance_miles, 1.0), 3)
+        cost_pm = row.cost_per_mile
+        est_cost = row.estimated_cost
+        if cost_pm is None or est_cost is None:
+            cost_pm, est_cost = estimate_operating_cost(row.distance_miles, rng=random.Random(i))
         records.append(
             {
                 "shipment_id": f"HS-{i:05d}",
@@ -400,11 +401,12 @@ def export_db_history_csv(db: Session, path: Path | None = None) -> Path:
                 "destination_longitude": row.destination_longitude,
                 "distance_miles": row.distance_miles,
                 "weight_lbs": row.weight_lbs,
-                "equipment_type": row.equipment_type,
                 "order_type": row.order_type,
                 "offered_rate": row.offered_rate,
                 "bid_rate": row.bid_rate if row.bid_rate is not None else "",
                 "won": row.won,
+                "cost_per_mile": cost_pm,
+                "estimated_cost": est_cost,
                 "margin_estimate": row.margin_estimate if row.margin_estimate is not None else "",
                 "shipped_at": row.shipped_at.replace(microsecond=0).isoformat(sep=" "),
                 "market_rpm": all_in,

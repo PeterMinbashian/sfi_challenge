@@ -10,6 +10,7 @@ from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
 from app.config import settings
+from app.history_data import haversine_miles
 from app.models import Driver, LiveOrder, Terminal
 from app.services.clock import clock
 
@@ -20,6 +21,20 @@ class Assignment:
     terminal: Terminal
 
 
+def nearest_terminal(
+    db: Session,
+    latitude: float,
+    longitude: float,
+) -> Terminal | None:
+    terminals = db.query(Terminal).all()
+    if not terminals:
+        return None
+    return min(
+        terminals,
+        key=lambda t: (t.latitude - latitude) ** 2 + (t.longitude - longitude) ** 2,
+    )
+
+
 def _origin_terminal(db: Session, order: LiveOrder) -> Terminal | None:
     if order.origin_terminal_code:
         return (
@@ -27,14 +42,7 @@ def _origin_terminal(db: Session, order: LiveOrder) -> Terminal | None:
             .filter(Terminal.code == order.origin_terminal_code.upper())
             .first()
         )
-    terminals = db.query(Terminal).all()
-    if not terminals:
-        return None
-    return min(
-        terminals,
-        key=lambda t: (t.latitude - order.origin_latitude) ** 2
-        + (t.longitude - order.origin_longitude) ** 2,
-    )
+    return nearest_terminal(db, order.origin_latitude, order.origin_longitude)
 
 
 def is_unit_free(unit: Driver, busy_from: datetime) -> bool:
@@ -59,15 +67,9 @@ def available_units(
     db: Session,
     terminal: Terminal,
     as_of: datetime | None = None,
-    equipment_type: str | None = None,
 ) -> list[Driver]:
     as_of = as_of or clock.now()
-    units = units_at_terminal(db, terminal)
-    free = [u for u in units if is_unit_free(u, as_of)]
-    if equipment_type:
-        matched = [u for u in free if u.equipment_type == equipment_type]
-        return matched or free  # fall back to any equipment if exact match unavailable
-    return free
+    return [u for u in units_at_terminal(db, terminal) if is_unit_free(u, as_of)]
 
 
 def terminal_availability(
@@ -96,17 +98,63 @@ def terminal_availability(
     return out
 
 
+def estimate_board_deadhead(db: Session, order: LiveOrder) -> tuple[float, float]:
+    """
+    Empty miles (and $) from the board's likely unit to the pickup.
+
+    Uses the nearest free unit at the booking hub (as of pickup_at), or the
+    hub pin if none are free yet. Loaded-mile cost stays on estimated_cost.
+    """
+    terminal = _origin_terminal(db, order)
+    cpm = float(order.cost_per_mile or 0.0)
+    if not terminal:
+        return 0.0, 0.0
+
+    free = available_units(db, terminal, as_of=order.pickup_at)
+    if free:
+        unit = min(
+            free,
+            key=lambda u: haversine_miles(
+                u.current_latitude,
+                u.current_longitude,
+                order.origin_latitude,
+                order.origin_longitude,
+            ),
+        )
+        miles = haversine_miles(
+            unit.current_latitude,
+            unit.current_longitude,
+            order.origin_latitude,
+            order.origin_longitude,
+        )
+    else:
+        miles = haversine_miles(
+            terminal.latitude,
+            terminal.longitude,
+            order.origin_latitude,
+            order.origin_longitude,
+        )
+    cost = round(miles * cpm, 2)
+    return miles, cost
+
+
+def enforce_weight_limit(order: LiveOrder) -> None:
+    if order.weight_lbs > settings.max_weight_lbs:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Weight {order.weight_lbs} lbs exceeds board max "
+                f"{settings.max_weight_lbs} lbs"
+            ),
+        )
+
+
 def find_assignment(db: Session, order: LiveOrder) -> Assignment:
     terminal = _origin_terminal(db, order)
     if not terminal:
         raise HTTPException(status_code=409, detail="No terminal available for origin")
 
-    free = available_units(
-        db,
-        terminal,
-        as_of=order.pickup_at,
-        equipment_type=order.equipment_type,
-    )
+    free = available_units(db, terminal, as_of=order.pickup_at)
     if not free:
         raise HTTPException(
             status_code=409,
@@ -115,7 +163,17 @@ def find_assignment(db: Session, order: LiveOrder) -> Assignment:
                 f"for pickup window starting {order.pickup_at.isoformat()}"
             ),
         )
-    return Assignment(unit=free[0], terminal=terminal)
+    # Prefer the unit with the shortest empty move to the pickup
+    unit = min(
+        free,
+        key=lambda u: haversine_miles(
+            u.current_latitude,
+            u.current_longitude,
+            order.origin_latitude,
+            order.origin_longitude,
+        ),
+    )
+    return Assignment(unit=unit, terminal=terminal)
 
 
 def lock_assignment(assignment: Assignment, order: LiveOrder) -> None:
@@ -130,6 +188,7 @@ def lock_assignment(assignment: Assignment, order: LiveOrder) -> None:
 
 def book_order(db: Session, order: LiveOrder) -> Assignment:
     """Capacity check + lock one fleet unit. Caller sets status and commits."""
+    enforce_weight_limit(order)
     assignment = find_assignment(db, order)
     lock_assignment(assignment, order)
     return assignment
@@ -199,6 +258,12 @@ def advance_order_lifecycle(db: Session) -> dict:
 
 
 def _release_unit(db: Session, order: LiveOrder) -> None:
+    """
+    Free the unit and move its capacity to the destination hub.
+
+    After delivery, the unit's home_terminal becomes the destination terminal
+    (or the nearest hub if the drop is off-pin). Next bookings pull from that hub.
+    """
     if not order.assigned_driver_id:
         return
     unit = db.get(Driver, order.assigned_driver_id)
@@ -208,11 +273,15 @@ def _release_unit(db: Session, order: LiveOrder) -> None:
     unit.available_at = None
     unit.current_latitude = order.destination_latitude
     unit.current_longitude = order.destination_longitude
+
+    dest: Terminal | None = None
     if order.destination_terminal_code:
         dest = (
             db.query(Terminal)
-            .filter(Terminal.code == order.destination_terminal_code)
+            .filter(Terminal.code == order.destination_terminal_code.upper())
             .first()
         )
-        if dest:
-            unit.home_terminal_id = dest.id
+    if dest is None:
+        dest = nearest_terminal(db, order.destination_latitude, order.destination_longitude)
+    if dest is not None:
+        unit.home_terminal_id = dest.id

@@ -32,20 +32,43 @@ LAST_NAMES = [
     "Nguyen", "Patel", "Garcia", "Johnson", "Kim", "Brown", "Martinez", "Lee",
     "Wilson", "Anderson", "Thomas", "Jackson", "White", "Harris", "Clark",
 ]
-EQUIPMENT = ["dry_van", "reefer", "flatbed"]
-
 __all__ = [
     "TERMINAL_DEFS",
-    "EQUIPMENT",
     "haversine_miles",
     "jitter",
     "seed_if_empty",
 ]
 
 
+def _backfill_history_costs(db: Session) -> None:
+    """Fill cost columns on older DB rows that predate estimated_cost."""
+    from app.history_data import estimate_operating_cost
+
+    missing = (
+        db.query(HistoricalShipment)
+        .filter(
+            (HistoricalShipment.estimated_cost.is_(None))
+            | (HistoricalShipment.cost_per_mile.is_(None))
+        )
+        .all()
+    )
+    if not missing:
+        return
+    for i, row in enumerate(missing, start=1):
+        cpm, total = estimate_operating_cost(row.distance_miles, rng=random.Random(10_000 + i))
+        row.cost_per_mile = cpm
+        row.estimated_cost = total
+        if row.won and row.margin_estimate is None:
+            payout = row.bid_rate if row.order_type == "open_bid" and row.bid_rate else row.offered_rate
+            if payout is not None:
+                row.margin_estimate = round(payout - total, 2)
+    db.commit()
+
+
 def seed_if_empty(db: Session) -> None:
     if db.query(Terminal).count() > 0:
         if db.query(HistoricalShipment).count() > 0:
+            _backfill_history_costs(db)
             ensure_history_csv(db)
         return
 
@@ -61,7 +84,6 @@ def seed_if_empty(db: Session) -> None:
     for t in terminals:
         for i in range(1, settings.units_per_terminal + 1):
             lat, lon = jitter(t.latitude, t.longitude, miles=rng.uniform(1, 12), rng=rng)
-            equipment = rng.choices(EQUIPMENT, weights=[0.62, 0.22, 0.16], k=1)[0]
             status = "available" if i < settings.units_per_terminal else "maintenance"
             db.add(
                 Driver(
@@ -70,7 +92,6 @@ def seed_if_empty(db: Session) -> None:
                     first_name=rng.choice(FIRST_NAMES),
                     last_name=rng.choice(LAST_NAMES),
                     home_terminal_id=t.id,
-                    equipment_type=equipment,
                     status=status,
                     current_latitude=lat,
                     current_longitude=lon,

@@ -14,14 +14,14 @@ from app.schemas import (
     LiveOrderOut,
 )
 from app.services.clock import clock
-from app.services.dispatch import book_order
+from app.services.dispatch import book_order, enforce_weight_limit
 from app.services.order_simulator import expire_stale_orders, hub, order_to_dict
 
 router = APIRouter(prefix="/orders", tags=["orders"])
 
 
-def _enrich(order: LiveOrder) -> LiveOrderOut:
-    return LiveOrderOut.model_validate(order_to_dict(order))
+def _enrich(order: LiveOrder, db: Session) -> LiveOrderOut:
+    return LiveOrderOut.model_validate(order_to_dict(order, db=db))
 
 
 @router.get("", response_model=list[LiveOrderOut])
@@ -40,7 +40,7 @@ def list_orders(
     if order_type:
         q = q.filter(LiveOrder.order_type == order_type)
     orders = q.order_by(LiveOrder.created_at.desc()).limit(200).all()
-    return [_enrich(o) for o in orders]
+    return [_enrich(o, db) for o in orders]
 
 
 @router.get("/{external_id}", response_model=LiveOrderOut)
@@ -49,7 +49,7 @@ def get_order(external_id: str, db: Session = Depends(get_db)) -> LiveOrderOut:
     order = db.query(LiveOrder).filter(LiveOrder.external_id == external_id.upper()).first()
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
-    return _enrich(order)
+    return _enrich(order, db)
 
 
 def _require_open(order: LiveOrder | None) -> LiveOrder:
@@ -98,7 +98,7 @@ def accept_order(
             f"({assignment.unit.employee_code}) at {assignment.terminal.code} "
             f"until {order.delivery_at.isoformat()}"
         ),
-        order=_enrich(order),
+        order=_enrich(order, db),
     )
 
 
@@ -122,7 +122,7 @@ def decline_order(
     )
     db.commit()
     db.refresh(order)
-    return ActionResponse(ok=True, message="Order declined", order=_enrich(order))
+    return ActionResponse(ok=True, message="Order declined", order=_enrich(order, db))
 
 
 @router.post("/{external_id}/bid", response_model=ActionResponse)
@@ -140,6 +140,7 @@ def bid_order(
             status_code=400,
             detail="Only open_bid orders accept bids; use POST /orders/{id}/accept for fixed_rate",
         )
+    enforce_weight_limit(order)
     now = clock.now()
     order.status = "bid_submitted"
     order.winning_bid_rate = body.bid_rate
@@ -161,7 +162,7 @@ def bid_order(
             f"Bid of ${body.bid_rate:.2f} submitted — shipper decides at "
             f"{order.bid_decision_at.isoformat()} (sim time)"
         ),
-        order=_enrich(order),
+        order=_enrich(order, db),
     )
 
 
@@ -182,7 +183,7 @@ async def orders_ws(websocket: WebSocket) -> None:
             await websocket.send_json(
                 {
                     "event": "snapshot",
-                    "orders": [order_to_dict(o) for o in open_orders],
+                    "orders": [order_to_dict(o, db=db) for o in open_orders],
                     "clock": clock.snapshot(),
                 }
             )
